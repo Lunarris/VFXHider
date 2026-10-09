@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>0.0.0.1</Version>
+    <Author>Lunarris</Author>
+    <Name>VFX Hider</Name>
+    <Punchline>Cut down visual noise from other players' VFX.</Punchline>
+    <Description>Helps trim down the visual noise in venues or in heavily sync'd areas. Useful for large shells or if you have that one friend with an annoying dote.</Description>
+    <RepoUrl>https://github.com/Lunarris/VFXHider</RepoUrl>
+    <Tags>vfx;social;venue;emote</Tags>
+  </PropertyGroup>
+</Project>

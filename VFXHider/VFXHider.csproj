@@ -9,4 +9,8 @@
     <RepoUrl>https://github.com/Lunarris/VFXHider</RepoUrl>
     <Tags>vfx;social;venue;emote</Tags>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="images\VFXHider.png" Link="images\icon.png" CopyToOutputDirectory="Always" />
+  </ItemGroup>
 </Project>

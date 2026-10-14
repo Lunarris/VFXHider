@@ -27,7 +27,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
     private const string ActorVfxCreateSig = "40 53 55 56 57 48 81 EC ?? ?? ?? ?? 0F 29 B4 24 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 0F B6 AC 24 ?? ?? ?? ?? 0F 28 F3 49 8B F8";
     private const string StaticVfxRemoveSig = "40 53 48 83 EC 20 48 8B D9 48 8B 89 ?? ?? ?? ?? 48 85 C9 74 28 33 D2 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
 
-    public const string VerifiedGameVersion = "2026.09.15.0000.0000";
+    public const string VerifiedGameVersion = "2026.10.06.0000.0000";
 
     private delegate nint ActorVfxCreateDelegate(byte* path, GameObject* caster, GameObject* target, float a4, byte a5, ushort a6, byte a7);
 
@@ -48,6 +48,14 @@ public sealed unsafe class VfxFilterModule : IDisposable
         public FFXIVClientStructs.FFXIV.Common.Math.Vector3 OriginalScale;
     }
 
+    private sealed class MutedCharacter
+    {
+        public uint EntityId;
+        public byte Category;
+        public byte CategoryOverride;
+        public bool Seen;
+    }
+
     private readonly VfxFilterConfig config;
     private readonly ICallGateSubscriber<string, int, string> penumbraResolveGameObjectPath;
 
@@ -58,6 +66,10 @@ public sealed unsafe class VfxFilterModule : IDisposable
     private readonly Dictionary<nint, LiveStaticVfx> liveStatic = [];
     private readonly List<nint> staleScratch = [];
     private bool filterDirty;
+
+    private const byte NoPlayCategory = (byte)FFXIVClientStructs.FFXIV.Client.Sound.SoundVolumeCategory.NoPlay;
+    private readonly Dictionary<nint, MutedCharacter> mutedCharacters = [];
+    private readonly List<nint> unmutedScratch = [];
 
     private const int CharacterSlotEnd = 200;
 
@@ -333,6 +345,8 @@ public sealed unsafe class VfxFilterModule : IDisposable
             liveStatic.Clear();
         }
 
+        UnmuteAll();
+
         lock (spawnRates)
             spawnRates.Clear();
 
@@ -457,6 +471,15 @@ public sealed unsafe class VfxFilterModule : IDisposable
         catch (Exception ex)
         {
             Plugin.Log.Error(ex, "VfxFilter: error in per-frame update.");
+        }
+
+        try
+        {
+            UpdateEmoteMutes();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Error(ex, "VfxFilter: error while muting emote sounds.");
         }
 
         lock (liveStatic)
@@ -613,6 +636,112 @@ public sealed unsafe class VfxFilterModule : IDisposable
             PenumbraFilesMatched++;
             VFXUsers.Note(player.Key, VFXUse.VfxFile, file.GamePath);
         }
+    }
+
+    private void UpdateEmoteMutes()
+    {
+        foreach (var entry in mutedCharacters.Values)
+            entry.Seen = false;
+
+        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
+        for (var i = 0; i < CharacterSlotEnd; i += 2)
+        {
+            var obj = objects[i].Value;
+            if (obj == null || obj->ObjectKind != ObjectKind.Pc)
+                continue;
+
+            var character = (Character*)obj;
+            var known = mutedCharacters.TryGetValue((nint)obj, out var muted) && muted.EntityId == obj->EntityId;
+
+            if (!ShouldMute(character))
+            {
+                if (known)
+                    Unmute(character, muted!);
+
+                continue;
+            }
+
+            if (!known)
+            {
+                mutedCharacters[(nint)obj] = muted = new MutedCharacter
+                {
+                    EntityId = obj->EntityId,
+                    Category = character->SoundVolumeCategory,
+                    CategoryOverride = character->SoundVolumeCategoryOverride,
+                };
+            }
+            else
+            {
+                if (character->SoundVolumeCategory != NoPlayCategory)
+                    muted!.Category = character->SoundVolumeCategory;
+
+                if (character->SoundVolumeCategoryOverride != NoPlayCategory)
+                    muted!.CategoryOverride = character->SoundVolumeCategoryOverride;
+            }
+
+            muted!.Seen = true;
+            character->SoundVolumeCategory = NoPlayCategory;
+            character->SoundVolumeCategoryOverride = NoPlayCategory;
+        }
+
+        foreach (var (address, entry) in mutedCharacters)
+        {
+            if (!entry.Seen)
+                unmutedScratch.Add(address);
+        }
+
+        foreach (var address in unmutedScratch)
+            mutedCharacters.Remove(address);
+
+        unmutedScratch.Clear();
+    }
+
+    private bool ShouldMute(Character* character)
+    {
+        if (!config.MuteBlockedEmoteSounds)
+            return false;
+
+        var emoteId = character->EmoteController.EmoteId;
+        if (emoteId == 0 || !IsBlockedPresetEmote(emoteId))
+            return false;
+
+        var player = Resolve((GameObject*)character);
+        if (player.IsLocalPlayer)
+            return config.IncludeSelfForTesting;
+
+        if (PlayerKey.IsListed(config.Blacklist, player.Name, player.World))
+            return true;
+
+        if (config.ExemptPartyAndFriends && (player.IsPartyMember || player.IsFriend))
+            return false;
+
+        return !PlayerKey.IsListed(config.Whitelist, player.Name, player.World);
+    }
+
+    private static void Unmute(Character* character, MutedCharacter muted)
+    {
+        if (character->SoundVolumeCategory == NoPlayCategory)
+            character->SoundVolumeCategory = muted.Category;
+
+        if (character->SoundVolumeCategoryOverride == NoPlayCategory)
+            character->SoundVolumeCategoryOverride = muted.CategoryOverride;
+    }
+
+    private void UnmuteAll()
+    {
+        if (mutedCharacters.Count == 0)
+            return;
+
+        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
+        for (var i = 0; i < CharacterSlotEnd; i += 2)
+        {
+            var obj = objects[i].Value;
+            if (obj != null && obj->ObjectKind == ObjectKind.Pc
+                && mutedCharacters.TryGetValue((nint)obj, out var muted) && muted.EntityId == obj->EntityId)
+                Unmute((Character*)obj, muted);
+        }
+
+        mutedCharacters.Clear();
     }
 
     private static void Hide(VfxObject* vfx, LiveStaticVfx live)

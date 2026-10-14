@@ -16,6 +16,8 @@ public class VfxFilterConfig
     [JsonProperty(ObjectCreationHandling = ObjectCreationHandling.Replace)]
     public List<string> BlockedPresetEmotes { get; set; } = [.. VfxFilterModule.PresetEmoteNames];
 
+    public bool MuteBlockedEmoteSounds { get; set; } = true;
+
     public bool ExemptPartyAndFriends { get; set; } = true;
 
     public List<string> Whitelist { get; set; } = [];

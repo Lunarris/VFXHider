@@ -73,6 +73,16 @@ public class MainWindow : Window, IDisposable
                     ImGui.SetTooltip("This emote was not found in the game data.");
             }
 
+            var mute = config.MuteBlockedEmoteSounds;
+            if (ImGui.Checkbox("Also mute players while they use these emotes", ref mute))
+            {
+                config.MuteBlockedEmoteSounds = mute;
+                Save();
+            }
+
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Silences every sound from the player for as long as the emote lasts, modded or not.");
+
             ImGui.Separator();
             ImGui.TextDisabled($"Effects hidden this session: {module.TotalHidden}");
         }

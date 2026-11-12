@@ -27,7 +27,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
     private const string ActorVfxCreateSig = "40 53 55 56 57 48 81 EC ?? ?? ?? ?? 0F 29 B4 24 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 0F B6 AC 24 ?? ?? ?? ?? 0F 28 F3 49 8B F8";
     private const string StaticVfxRemoveSig = "40 53 48 83 EC 20 48 8B D9 48 8B 89 ?? ?? ?? ?? 48 85 C9 74 28 33 D2 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
 
-    public const string VerifiedGameVersion = "2026.10.16.0000.0000";
+    public const string VerifiedGameVersion = "2026.11.03.0000.0000";
 
     private delegate nint ActorVfxCreateDelegate(byte* path, GameObject* caster, GameObject* target, float a4, byte a5, ushort a6, byte a7);
 
@@ -81,6 +81,14 @@ public sealed unsafe class VfxFilterModule : IDisposable
     private int nextRecentResolve;
 
     private readonly Dictionary<uint, (long Second, int Count)> spawnRates = [];
+
+    private readonly Dictionary<nint, int> slotScratch = [];
+
+    private readonly ErrorThrottle errors = new();
+
+    public PlayerEntry[] Blacklist { get; private set; } = [];
+
+    public PlayerEntry[] Whitelist { get; private set; } = [];
 
     private readonly ICallGateSubscriber<nint, string, string, object?> penumbraResourceResolved;
     private readonly ICallGateSubscriber<int, int, object?> penumbraRedrawObject;
@@ -171,6 +179,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
     public VfxFilterModule(VfxFilterConfig config)
     {
         this.config = config;
+        ParseLists();
 
         penumbraResolveGameObjectPath = Plugin.PluginInterface.GetIpcSubscriber<string, int, string>("Penumbra.ResolveGameObjectPath");
 
@@ -221,8 +230,39 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     public void OnFilterSettingsChanged()
     {
+        ParseLists();
         filterDirty = true;
         modStateCache.Clear();
+    }
+
+    private void ParseLists()
+    {
+        Blacklist = PlayerKey.Parse(config.Blacklist);
+        Whitelist = PlayerKey.Parse(config.Whitelist);
+    }
+
+    public bool IsBlacklisted(string key)
+    {
+        var (name, world) = PlayerKey.Split(key);
+        return PlayerKey.IsListed(Blacklist, name, world);
+    }
+
+    public bool IsWhitelisted(string key)
+    {
+        var (name, world) = PlayerKey.Split(key);
+        return PlayerKey.IsListed(Whitelist, name, world);
+    }
+
+    public void CollectNearbyPlayers(List<(string Name, string World)> destination)
+    {
+        destination.Clear();
+        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
+        for (var i = 0; i < CharacterSlotEnd; i += 2)
+        {
+            var obj = objects[i].Value;
+            if (obj != null && obj->ObjectKind == ObjectKind.Pc)
+                destination.Add((obj->NameString, WorldOf(obj)));
+        }
     }
 
     private static string WorldOf(GameObject* obj)
@@ -232,18 +272,6 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     private static bool IsPlayer(GameObject* obj, string key)
         => obj != null && obj->ObjectKind == ObjectKind.Pc && PlayerKey.Matches(key, obj->NameString, WorldOf(obj));
-
-    public bool IsPlayerNearby(string key)
-    {
-        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
-        for (var i = 0; i < CharacterSlotEnd; i += 2)
-        {
-            if (IsPlayer(objects[i].Value, key))
-                return true;
-        }
-
-        return false;
-    }
 
     public bool RedrawPlayer(string key)
     {
@@ -382,7 +410,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "VfxFilter: error while inspecting actor VFX.");
+            errors.Error(ex, "VfxFilter: error while inspecting actor VFX.");
         }
 
         if (record is { HideReason.Length: > 0 })
@@ -434,7 +462,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "VfxFilter: error while logging static VFX.");
+            errors.Error(ex, "VfxFilter: error while logging static VFX.");
         }
 
         return vfx;
@@ -456,7 +484,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "VfxFilter: error while handling static VFX removal.");
+            errors.Error(ex, "VfxFilter: error while handling static VFX removal.");
         }
 
         return staticVfxRemoveHook!.Original(vfx);
@@ -470,7 +498,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "VfxFilter: error in per-frame update.");
+            errors.Error(ex, "VfxFilter: error in per-frame update.");
         }
 
         try
@@ -479,7 +507,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "VfxFilter: error while muting emote sounds.");
+            errors.Error(ex, "VfxFilter: error while muting emote sounds.");
         }
 
         lock (liveStatic)
@@ -612,19 +640,17 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
         var objects = GameObjectManager.Instance()->Objects.IndexSorted;
 
+        slotScratch.Clear();
+        for (var i = 0; i < CharacterSlotEnd; i++)
+        {
+            var obj = (nint)objects[i].Value;
+            if (obj != nint.Zero)
+                slotScratch.TryAdd(obj, i);
+        }
+
         while (resolvedFiles.TryDequeue(out var file))
         {
-            var slot = -1;
-            for (var i = 0; i < CharacterSlotEnd; i++)
-            {
-                if ((nint)objects[i].Value == file.GameObject)
-                {
-                    slot = i;
-                    break;
-                }
-            }
-
-            if (slot < 0)
+            if (!slotScratch.TryGetValue(file.GameObject, out var slot))
                 continue;
 
             var source = Resolve(objects[slot].Value);
@@ -709,13 +735,13 @@ public sealed unsafe class VfxFilterModule : IDisposable
         if (player.IsLocalPlayer)
             return config.IncludeSelfForTesting;
 
-        if (PlayerKey.IsListed(config.Blacklist, player.Name, player.World))
+        if (PlayerKey.IsListed(Blacklist, player.Name, player.World))
             return true;
 
         if (config.ExemptPartyAndFriends && (player.IsPartyMember || player.IsFriend))
             return false;
 
-        return !PlayerKey.IsListed(config.Whitelist, player.Name, player.World);
+        return !PlayerKey.IsListed(Whitelist, player.Name, player.World);
     }
 
     private static void Unmute(Character* character, MutedCharacter muted)
@@ -849,7 +875,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
         var blamed = source.Kind == ObjectKind.Pc ? source : record.Target;
         if (record.ModState == VfxModState.Modded && blamed.Kind == ObjectKind.Pc && !blamed.IsLocalPlayer
-            && PlayerKey.IsListed(config.Blacklist, blamed.Name, blamed.World))
+            && PlayerKey.IsListed(Blacklist, blamed.Name, blamed.World))
             return "blacklist";
 
         if (source.Kind != ObjectKind.Pc)
@@ -861,7 +887,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         if (!source.IsLocalPlayer && config.ExemptPartyAndFriends && (source.IsPartyMember || source.IsFriend))
             return string.Empty;
 
-        if (PlayerKey.IsListed(config.Whitelist, source.Name, source.World))
+        if (PlayerKey.IsListed(Whitelist, source.Name, source.World))
             return string.Empty;
 
         if (!viaMinion && record.ModState == VfxModState.Modded && source.EmoteId != 0 && IsBlockedPresetEmote(source.EmoteId))

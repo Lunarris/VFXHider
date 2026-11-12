@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Utility.Raii;
@@ -8,7 +7,7 @@ using VFXHider.VfxFilter;
 
 namespace VFXHider.Windows;
 
-public class MainWindow : Window, IDisposable
+public class MainWindow : ThemedWindow, IDisposable
 {
     private readonly Configuration configuration;
     private readonly Plugin plugin;
@@ -23,69 +22,17 @@ public class MainWindow : Window, IDisposable
 
     public void Dispose() { }
 
-    public override void Draw()
+    protected override void DrawContents()
     {
-        var config = configuration.VfxFilter;
         var module = plugin.VfxFilter;
-
-        var enabled = config.Enabled;
-        if (ImGui.Checkbox("Enable VFX Hider", ref enabled))
-            plugin.SetVfxFilterEnabled(enabled);
 
         if (!module.SignaturesTrusted)
             DrawVersionWarning(module);
 
-        using (ImRaii.Disabled(!config.Enabled))
-        {
-            ImGui.Separator();
-
-
-            var exempt = config.ExemptPartyAndFriends;
-            if (ImGui.Checkbox("Allow emotes for Friends and Party Members", ref exempt))
-            {
-                config.ExemptPartyAndFriends = exempt;
-                Save();
-            }
-
-            ImGui.Separator();
-            ImGui.Text("Enable blocks for modded VFX on below emotes:");
-
-            foreach (var preset in VfxFilterModule.PresetEmoteNames)
-            {
-                var found = module.PresetEmoteIds.TryGetValue(preset, out var ids);
-
-                var label = found && module.EmoteNames.TryGetValue(ids!.First(), out var localName) ? localName : preset;
-
-                using (ImRaii.Disabled(!found))
-                {
-                    var blocked = config.BlockedPresetEmotes.Contains(preset);
-                    if (ImGui.Checkbox($"{label}##Preset{preset}", ref blocked))
-                    {
-                        config.BlockedPresetEmotes.Remove(preset);
-                        if (blocked)
-                            config.BlockedPresetEmotes.Add(preset);
-
-                        Save();
-                    }
-                }
-
-                if (!found && ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
-                    ImGui.SetTooltip("This emote was not found in the game data.");
-            }
-
-            var mute = config.MuteBlockedEmoteSounds;
-            if (ImGui.Checkbox("Also mute players while they use these emotes", ref mute))
-            {
-                config.MuteBlockedEmoteSounds = mute;
-                Save();
-            }
-
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Silences every sound from the player for as long as the emote lasts, modded or not.");
-
-            ImGui.Separator();
-            ImGui.TextDisabled($"Effects hidden this session: {module.TotalHidden}");
-        }
+        if (configuration.VfxFilter.Enabled)
+            ImGui.TextUnformatted($"Effects hidden this session: {module.TotalHidden}");
+        else
+            ImGui.TextDisabled("VFX Hider is off. Turn it on in Settings, General.");
 
         ImGui.Separator();
 
@@ -96,9 +43,8 @@ public class MainWindow : Window, IDisposable
         if (ImGui.Button("Blacklist"))
             plugin.ToggleBlacklistUi();
 
-
         ImGui.SameLine();
-        if (ImGui.Button("Advanced Settings"))
+        if (ImGui.Button("Settings"))
             plugin.ToggleConfigUi();
     }
 
@@ -106,7 +52,6 @@ public class MainWindow : Window, IDisposable
     {
         var version = module.GameVersion.Length > 0 ? module.GameVersion : "unknown";
 
-        ImGui.Separator();
         using (ImRaii.PushColor(ImGuiCol.Text, new Vector4(1f, 0.75f, 0.2f, 1f)))
         {
             ImGui.TextWrapped($"Game version {version} is not the one this plugin was checked against ({VfxFilterModule.VerifiedGameVersion}).");
@@ -129,11 +74,5 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip(module.GameVersion.Length == 0 ? "The game version could not be read, so it cannot be confirmed." : "Hold Ctrl and click.");
 
         ImGui.Separator();
-    }
-
-    private void Save()
-    {
-        configuration.Save();
-        plugin.VfxFilter.OnFilterSettingsChanged();
     }
 }

@@ -3,8 +3,39 @@ using System.Collections.Generic;
 
 namespace VFXHider.VfxFilter;
 
+public readonly record struct PlayerEntry(string Raw, string Name, string World)
+{
+    public bool Matches(string name, string world)
+        => Name.Length > 0
+            && Name.Equals(name, StringComparison.OrdinalIgnoreCase)
+            && (World.Length == 0 || world.Length == 0 || World.Equals(world, StringComparison.OrdinalIgnoreCase));
+}
+
 public static class PlayerKey
 {
+    public static PlayerEntry[] Parse(List<string> entries)
+    {
+        var parsed = new PlayerEntry[entries.Count];
+        for (var i = 0; i < parsed.Length; i++)
+        {
+            var (name, world) = Split(entries[i]);
+            parsed[i] = new PlayerEntry(entries[i].Trim(), name, world);
+        }
+
+        return parsed;
+    }
+
+    public static bool IsListed(PlayerEntry[] entries, string name, string world)
+    {
+        foreach (var entry in entries)
+        {
+            if (entry.Matches(name, world))
+                return true;
+        }
+
+        return false;
+    }
+
     public static string Make(string name, string world)
         => world.Length == 0 ? name : $"{name}@{world}";
 

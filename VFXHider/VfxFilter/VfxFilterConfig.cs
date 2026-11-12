@@ -40,4 +40,21 @@ public class VfxFilterConfig
     public string ConfirmedGameVersion { get; set; } = string.Empty;
 
     public bool IncludeSelfForTesting { get; set; } = false;
+
+    public void CopySettingsFrom(VfxFilterConfig other)
+    {
+        Enabled = other.Enabled;
+        ExemptPartyAndFriends = other.ExemptPartyAndFriends;
+        BlockedPresetEmotes = [.. other.BlockedPresetEmotes];
+        MuteBlockedEmoteSounds = other.MuteBlockedEmoteSounds;
+        RedrawOnListChange = other.RedrawOnListChange;
+        HideEffects = other.HideEffects;
+        HideModded = other.HideModded;
+        ModdedScopePatterns = [.. other.ModdedScopePatterns];
+        HideModdedMinionEffects = other.HideModdedMinionEffects;
+        BlockPatterns = [.. other.BlockPatterns];
+        RateLimitPerSecond = other.RateLimitPerSecond;
+        IncludeSelfForTesting = other.IncludeSelfForTesting;
+        LogToPluginLog = other.LogToPluginLog;
+    }
 }

@@ -10,10 +10,16 @@ using VFXHider.VfxFilter;
 
 namespace VFXHider.Windows;
 
-public class VfxFilterWindow : Window, IDisposable
+public class VfxFilterWindow : ThemedWindow, IDisposable
 {
     private readonly Plugin plugin;
     private readonly List<VfxSpawnRecord> snapshot = new(VfxFilterModule.LogCapacity);
+    private readonly List<VfxSpawnRecord> shown = new(VfxFilterModule.LogCapacity);
+    private long snapshotVersion = -1;
+    private string shownSearch = string.Empty;
+    private bool shownOnlyInteresting;
+    private long shownVersion = -1;
+    private long shownAt;
     private bool autoScroll = true;
     private bool onlyInteresting;
     private string search = string.Empty;
@@ -35,7 +41,7 @@ public class VfxFilterWindow : Window, IDisposable
 
     public override void OnClose() => plugin.VfxFilter.CaptureSpawnLog = false;
 
-    public override void Draw()
+    protected override void DrawContents()
     {
         var config = plugin.Configuration.VfxFilter;
         var module = plugin.VfxFilter;
@@ -49,12 +55,17 @@ public class VfxFilterWindow : Window, IDisposable
     private void DrawSpawnLog(VfxFilterModule module)
     {
         var log = module.SpawnLog;
-        log.CopyTo(snapshot);
+        if (log.Version != snapshotVersion)
+        {
+            snapshotVersion = log.Version;
+            log.CopyTo(snapshot);
+        }
 
         if (ImGui.Button("Clear"))
         {
             log.Clear();
             snapshot.Clear();
+            shown.Clear();
         }
 
         ImGui.SameLine();
@@ -72,6 +83,8 @@ public class VfxFilterWindow : Window, IDisposable
         ImGui.SameLine();
         ImGui.Checkbox("Only modded or hidden rows", ref onlyInteresting);
 
+        RefreshShown();
+
         using var table = ImRaii.Table("VfxSpawns", 8,
             ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV | ImGuiTableFlags.Resizable | ImGuiTableFlags.ScrollY);
         if (!table.Success)
@@ -88,46 +101,66 @@ public class VfxFilterWindow : Window, IDisposable
         ImGui.TableSetupColumn("Hidden", ImGuiTableColumnFlags.WidthFixed, 70);
         ImGui.TableHeadersRow();
 
-        foreach (var record in snapshot)
-        {
-            if (!IsShown(record))
-                continue;
-
-            ImGui.TableNextRow();
-            ImGui.TableNextColumn();
-            ImGui.Text(record.Time.ToString("HH:mm:ss.fff"));
-            ImGui.TableNextColumn();
-            ImGui.Text(record.Kind.ToString());
-            ImGui.TableNextColumn();
-            ImGui.Text(record.Path);
-            ImGui.TableNextColumn();
-            ImGui.Text(record.SourceText);
-            ImGui.TableNextColumn();
-            ImGui.Text(record.Target.ToString());
-            ImGui.TableNextColumn();
-            ImGui.Text(record.EmoteName);
-            ImGui.TableNextColumn();
-            ImGui.Text(record.ModState.ToString());
-            if (record.ResolvedPath.Length > 0 && ImGui.IsItemHovered())
-                ImGui.SetTooltip(record.ResolvedPath);
-            ImGui.TableNextColumn();
-            ImGui.Text(record.HideReason);
-        }
+        ClippedRows.Draw(shown.Count, DrawRow);
 
         if (autoScroll && ImGui.GetScrollY() >= ImGui.GetScrollMaxY() - 1)
             ImGui.SetScrollHereY(1.0f);
     }
 
-    private bool IsShown(VfxSpawnRecord record)
+    private void DrawRow(int index)
+    {
+        var record = shown[index];
+
+        ImGui.TableNextRow();
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.TimeText);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.KindText);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.Path);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.SourceText);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.TargetText);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.EmoteName);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.ModStateText);
+        if (record.ResolvedPath.Length > 0 && ImGui.IsItemHovered())
+            ImGui.SetTooltip(record.ResolvedPath);
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(record.HideReason);
+    }
+
+    private void RefreshShown()
+    {
+        var now = Environment.TickCount64;
+        if (shownVersion == snapshotVersion && shownSearch == search && shownOnlyInteresting == onlyInteresting && now - shownAt < 1000)
+            return;
+
+        shownVersion = snapshotVersion;
+        shownSearch = search;
+        shownOnlyInteresting = onlyInteresting;
+        shownAt = now;
+
+        var term = search.Trim();
+        shown.Clear();
+        foreach (var record in snapshot)
+        {
+            if (IsShown(record, term))
+                shown.Add(record);
+        }
+    }
+
+    private bool IsShown(VfxSpawnRecord record, string term)
     {
         if (onlyInteresting && record.ModState != VfxModState.Modded && record.HideReason.Length == 0)
             return false;
 
-        var term = search.Trim();
         return term.Length == 0
             || record.Path.Contains(term, StringComparison.OrdinalIgnoreCase)
             || record.EmoteName.Contains(term, StringComparison.OrdinalIgnoreCase)
-            || record.Kind.ToString().Contains(term, StringComparison.OrdinalIgnoreCase)
+            || record.KindText.Contains(term, StringComparison.OrdinalIgnoreCase)
             || record.Source.Name.Contains(term, StringComparison.OrdinalIgnoreCase)
             || record.Owner.Name.Contains(term, StringComparison.OrdinalIgnoreCase)
             || record.Target.Name.Contains(term, StringComparison.OrdinalIgnoreCase);
@@ -146,11 +179,8 @@ public class VfxFilterWindow : Window, IDisposable
     private string BuildClipboardText()
     {
         var builder = new StringBuilder("Time\tType\tPath\tSource\tTarget\tEmote\tMod\tHidden\tResolved\n");
-        foreach (var record in snapshot)
-        {
-            if (IsShown(record))
-                builder.Append(record).Append('\n');
-        }
+        foreach (var record in shown)
+            builder.Append(record).Append('\n');
 
         return builder.ToString();
     }

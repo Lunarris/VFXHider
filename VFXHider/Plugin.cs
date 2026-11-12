@@ -31,7 +31,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public readonly WindowSystem WindowSystem = new("VFXHider");
     private MainWindow MainWindow { get; init; }
-    private ConfigWindow ConfigWindow { get; init; }
+    internal ConfigWindow ConfigWindow { get; init; }
     private VfxFilterWindow VfxFilterWindow { get; init; }
     private VFXUsersWindow VFXUsersWindow { get; init; }
     private BlacklistWindow BlacklistWindow { get; init; }
@@ -59,7 +59,7 @@ public sealed class Plugin : IDalamudPlugin
             HelpMessage = "Open VFX Hider. \"/vfxhider on\" and \"/vfxhider off\" switch it. \"users\", \"blacklist\" and \"config\" open those windows; \"log\" opens the debug spawn log."
         });
 
-        PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
+        PluginInterface.UiBuilder.Draw += DrawUi;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMainUi;
 
@@ -70,7 +70,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         ContextMenu.OnMenuOpened -= OnContextMenuOpened;
 
-        PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
+        PluginInterface.UiBuilder.Draw -= DrawUi;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUi;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
 
@@ -188,5 +188,12 @@ public sealed class Plugin : IDalamudPlugin
         Configuration.VfxFilter.Enabled = enabled;
         Configuration.Save();
         VfxFilter.SetEnabled(enabled);
+        ConfigWindow.SyncEnabled(enabled);
+    }
+
+    private void DrawUi()
+    {
+        Theme.Update(ConfigWindow.Preview ?? Configuration);
+        WindowSystem.Draw();
     }
 }

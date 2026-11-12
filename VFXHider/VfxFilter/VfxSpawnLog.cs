@@ -51,13 +51,30 @@ public sealed class VfxSpawnRecord
 
     public string SourceVia { get; set; } = string.Empty;
 
-    public string SourceText
+    private string? sourceText;
+    private string? targetText;
+    private string? timeText;
+
+    public string SourceText => sourceText ??= BuildSourceText();
+
+    public string TargetText => targetText ??= Target.ToString();
+
+    public string TimeText => timeText ??= Time.ToString("HH:mm:ss.fff");
+
+    public string KindText => Kind == VfxSpawnKind.Actor ? "Actor" : "Static";
+
+    public string ModStateText => ModState switch
     {
-        get
-        {
-            var text = Owner.IsNone ? Source.ToString() : $"{Source} of {Owner}";
-            return SourceVia.Length == 0 ? text : $"{text} <via {SourceVia}>";
-        }
+        VfxModState.Vanilla => "Vanilla",
+        VfxModState.Modded => "Modded",
+        VfxModState.Missing => "Missing",
+        _ => "Unknown",
+    };
+
+    private string BuildSourceText()
+    {
+        var text = Owner.IsNone ? Source.ToString() : $"{Source} of {Owner}";
+        return SourceVia.Length == 0 ? text : $"{text} <via {SourceVia}>";
     }
 
     public VfxModState ModState { get; set; } = VfxModState.Unknown;
@@ -70,7 +87,7 @@ public sealed class VfxSpawnRecord
 
     public string HideReason { get; set; } = string.Empty;
 
-    public override string ToString() => $"{Time:HH:mm:ss.fff}\t{Kind}\t{Path}\t{SourceText}\t{Target}\t{EmoteName}\t{ModState}\t{HideReason}\t{ResolvedPath}";
+    public override string ToString() => $"{TimeText}\t{KindText}\t{Path}\t{SourceText}\t{TargetText}\t{EmoteName}\t{ModStateText}\t{HideReason}\t{ResolvedPath}";
 }
 
 public sealed class VfxSpawnLog(int capacity)
@@ -82,6 +99,8 @@ public sealed class VfxSpawnLog(int capacity)
 
     public long TotalSpawns { get; private set; }
 
+    public long Version { get; private set; }
+
     public void Add(VfxSpawnRecord record)
     {
         lock (sync)
@@ -91,6 +110,7 @@ public sealed class VfxSpawnLog(int capacity)
             if (count < buffer.Length)
                 count++;
             TotalSpawns++;
+            Version++;
         }
     }
 
@@ -102,6 +122,7 @@ public sealed class VfxSpawnLog(int capacity)
             next = 0;
             count = 0;
             TotalSpawns = 0;
+            Version++;
         }
     }
 

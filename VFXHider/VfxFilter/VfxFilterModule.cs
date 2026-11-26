@@ -26,6 +26,9 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     private const string ActorVfxCreateSig = "40 53 55 56 57 48 81 EC ?? ?? ?? ?? 0F 29 B4 24 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? 0F B6 AC 24 ?? ?? ?? ?? 0F 28 F3 49 8B F8";
     private const string StaticVfxRemoveSig = "40 53 48 83 EC 20 48 8B D9 48 8B 89 ?? ?? ?? ?? 48 85 C9 74 28 33 D2 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
+    private const string PlaySoundSig = "F3 0F 11 54 24 ?? 55 56 57 41 56 41 57 48 81 EC ?? ?? ?? ?? 80 79 ?? 00 45 8B F9 48 8B F2 48 8B F9";
+    public const int SoundRecordCapacity = 200;
+    private const float MutedSoundRadius = 1f;
 
     public const string VerifiedGameVersion = "2026.11.03.0000.0000";
 
@@ -33,12 +36,16 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     private delegate nint StaticVfxRemoveDelegate(VfxObject* vfx);
 
+    private delegate nint PlaySoundDelegate(nint manager, nint data, float volume, int a4, float x, float y, float z, float a8,
+        int a9, int a10, byte a11, int category, byte a13, int a14, byte a15, byte a16, byte a17, byte a18);
+
     private sealed class LiveStaticVfx
     {
         public required VfxSpawnRecord Record;
         public nint VTable;
         public bool Pending = true;
         public bool HiddenByUs;
+        public bool RunBlocked;
 
         public nint PenumbraObject;
         public string PenumbraPath = string.Empty;
@@ -62,9 +69,17 @@ public sealed unsafe class VfxFilterModule : IDisposable
     private Hook<ActorVfxCreateDelegate>? actorVfxCreateHook;
     private Hook<VfxObject.Delegates.Create>? staticVfxCreateHook;
     private Hook<StaticVfxRemoveDelegate>? staticVfxRemoveHook;
+    private Hook<VfxObject.Delegates.Update>? staticVfxRunHook;
+    private Hook<PlaySoundDelegate>? playSoundHook;
+
+    private readonly LinkedList<SoundRecord> soundRecords = [];
+
+    private const int ModdedEmoteLimit = 2048;
+    private readonly HashSet<(uint EntityId, ushort EmoteId)> moddedEmotes = [];
 
     private readonly Dictionary<nint, LiveStaticVfx> liveStatic = [];
     private readonly List<nint> staleScratch = [];
+    private readonly List<nint> unblockScratch = [];
     private bool filterDirty;
 
     private const byte NoPlayCategory = (byte)FFXIVClientStructs.FFXIV.Client.Sound.SoundVolumeCategory.NoPlay;
@@ -146,6 +161,31 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     public long TotalHidden { get; private set; }
 
+    public long RunsBlocked { get; private set; }
+
+    public bool IsRunHooked => staticVfxRunHook != null;
+
+    public long SoundsStopped { get; private set; }
+
+    public bool RecordSounds { get; set; }
+
+    public bool IsPlaySoundHooked => playSoundHook != null;
+
+    public SoundRecord[] SoundRecords
+    {
+        get
+        {
+            lock (soundRecords)
+                return [.. soundRecords];
+        }
+    }
+
+    public void ClearSoundRecords()
+    {
+        lock (soundRecords)
+            soundRecords.Clear();
+    }
+
     public bool IsHooked => actorVfxCreateHook != null || staticVfxCreateHook != null;
 
     public string GameVersion { get; } = ReadGameVersion();
@@ -160,9 +200,8 @@ public sealed unsafe class VfxFilterModule : IDisposable
             var directory = System.IO.Path.GetDirectoryName(Environment.ProcessPath);
             return directory == null ? string.Empty : System.IO.File.ReadAllText(System.IO.Path.Combine(directory, "ffxivgame.ver")).Trim();
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Plugin.Log.Warning(ex, "VfxFilter: could not read the game version.");
             return string.Empty;
         }
     }
@@ -306,7 +345,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         try
         {
             var trusted = SignaturesTrusted;
-            if (!trusted)
+            if (!trusted && config.LogToPluginLog)
                 Plugin.Log.Warning($"VfxFilter: game version is \"{GameVersion}\" but the signatures were verified on {VerifiedGameVersion}. Actor VFX and effect hiding stay off until confirmed in the main window.");
 
             if (trusted)
@@ -327,18 +366,36 @@ public sealed unsafe class VfxFilterModule : IDisposable
             {
                 if (Plugin.SigScanner.TryScanText(StaticVfxRemoveSig, out var staticRemove))
                     staticVfxRemoveHook = Plugin.GameInterop.HookFromAddress<StaticVfxRemoveDelegate>(staticRemove, StaticVfxRemoveDetour);
-                else
+                else if (config.LogToPluginLog)
                     Plugin.Log.Warning("VfxFilter: static VFX remove signature not found, static VFX will be logged without source/target and never hidden.");
+            }
+
+            if (staticVfxRemoveHook != null)
+            {
+                var staticRun = (nint)VfxObject.Addresses.Update.Value;
+                if (staticRun != nint.Zero)
+                    staticVfxRunHook = Plugin.GameInterop.HookFromAddress<VfxObject.Delegates.Update>(staticRun, StaticVfxRunDetour);
+            }
+
+            if (trusted)
+            {
+                if (Plugin.SigScanner.TryScanText(PlaySoundSig, out var playSound))
+                    playSoundHook = Plugin.GameInterop.HookFromAddress<PlaySoundDelegate>(playSound, PlaySoundDetour);
+                else if (config.LogToPluginLog)
+                    Plugin.Log.Warning("VfxFilter: sound play signature not found, emote sounds are muted once per frame only.");
             }
 
             Plugin.Framework.Update += OnFrameworkUpdate;
             penumbraResourceResolved.Subscribe(OnPenumbraResourceResolved);
 
+            playSoundHook?.Enable();
+            staticVfxRunHook?.Enable();
             staticVfxRemoveHook?.Enable();
             staticVfxCreateHook?.Enable();
             actorVfxCreateHook?.Enable();
 
-            Plugin.Log.Information($"VfxFilter: hooks enabled (actor create {Describe(actorVfxCreateHook)}, static create {Describe(staticVfxCreateHook)}, static remove {Describe(staticVfxRemoveHook)}).");
+            if (config.LogToPluginLog)
+                Plugin.Log.Information($"VfxFilter: hooks enabled (actor create {Describe(actorVfxCreateHook)}, static create {Describe(staticVfxCreateHook)}, static run {Describe(staticVfxRunHook)}, static remove {Describe(staticVfxRemoveHook)}, sound play {Describe(playSoundHook)}).");
         }
         catch (Exception ex)
         {
@@ -349,6 +406,10 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
     private void Disable()
     {
+        playSoundHook?.Dispose();
+        playSoundHook = null;
+        ClearSoundRecords();
+
         Plugin.Framework.Update -= OnFrameworkUpdate;
         penumbraResourceResolved.Unsubscribe(OnPenumbraResourceResolved);
         resolvedFiles.Clear();
@@ -366,12 +427,25 @@ public sealed unsafe class VfxFilterModule : IDisposable
         {
             foreach (var (address, live) in liveStatic)
             {
-                if (live.HiddenByUs && IsStillAlive(address, live))
+                if (!IsStillAlive(address, live))
+                    continue;
+
+                if (live.HiddenByUs)
                     Show((VfxObject*)address, live);
+
+                if (live.RunBlocked)
+                    Unblock((VfxObject*)address, live);
             }
 
             liveStatic.Clear();
         }
+
+        staticVfxRunHook?.Dispose();
+        staticVfxRunHook = null;
+
+        lock (moddedEmotes)
+            moddedEmotes.Clear();
+
 
         UnmuteAll();
 
@@ -381,7 +455,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         modStateCache.Clear();
 
 
-        if (wasHooked)
+        if (wasHooked && config.LogToPluginLog)
             Plugin.Log.Information("VfxFilter: hooks disposed.");
     }
 
@@ -407,6 +481,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
 
             Classify(record);
             record.HideReason = Evaluate(record);
+            MuteEarly(record.Source);
         }
         catch (Exception ex)
         {
@@ -490,6 +565,65 @@ public sealed unsafe class VfxFilterModule : IDisposable
         return staticVfxRemoveHook!.Original(vfx);
     }
 
+    private void StaticVfxRunDetour(VfxObject* vfx, float deltaSeconds, int flags)
+    {
+        try
+        {
+            if (BlockRun(vfx))
+                return;
+        }
+        catch (Exception ex)
+        {
+            errors.Error(ex, "VfxFilter: error while checking a static VFX before it runs.");
+        }
+
+        staticVfxRunHook!.Original(vfx, deltaSeconds, flags);
+    }
+
+    private bool BlockRun(VfxObject* vfx)
+    {
+        if (vfx == null || !Plugin.Framework.IsInFrameworkUpdateThread)
+            return false;
+
+        lock (liveStatic)
+        {
+            if (!liveStatic.TryGetValue((nint)vfx, out var live) || !IsStillAlive((nint)vfx, live))
+                return false;
+
+            var record = live.Record;
+            if (live.Pending)
+            {
+                if (vfx->StaticCaster <= 0 && vfx->StaticTarget <= 0 && live.PenumbraObject == nint.Zero)
+                    return false;
+
+                live.Pending = false;
+                ResolveStatic(vfx, live);
+                record.HideReason = Evaluate(record);
+                if (record.HideReason.Length > 0)
+                    TotalHidden++;
+
+                Record(record);
+                MuteEarly(record.Source);
+            }
+
+            if (record.HideReason.Length == 0)
+                return false;
+
+            Hide(vfx, live);
+            if (!live.RunBlocked)
+                RunsBlocked++;
+
+            live.RunBlocked = true;
+            return true;
+        }
+    }
+
+    private void Unblock(VfxObject* vfx, LiveStaticVfx live)
+    {
+        live.RunBlocked = false;
+        staticVfxRunHook?.Original(vfx, 0, -1);
+    }
+
     private void OnFrameworkUpdate(IFramework framework)
     {
         try
@@ -551,15 +685,31 @@ public sealed unsafe class VfxFilterModule : IDisposable
                 }
 
                 if (record.HideReason.Length > 0)
+                {
                     Hide(vfx, live);
-                else if (live.HiddenByUs)
-                    Show(vfx, live);
+                }
+                else
+                {
+                    if (live.HiddenByUs)
+                        Show(vfx, live);
+
+                    if (live.RunBlocked)
+                        unblockScratch.Add(address);
+                }
             }
 
             foreach (var address in staleScratch)
                 liveStatic.Remove(address);
 
             staleScratch.Clear();
+
+            foreach (var address in unblockScratch)
+            {
+                if (liveStatic.TryGetValue(address, out var live) && IsStillAlive(address, live))
+                    Unblock((VfxObject*)address, live);
+            }
+
+            unblockScratch.Clear();
         }
     }
 
@@ -673,41 +823,8 @@ public sealed unsafe class VfxFilterModule : IDisposable
         for (var i = 0; i < CharacterSlotEnd; i += 2)
         {
             var obj = objects[i].Value;
-            if (obj == null || obj->ObjectKind != ObjectKind.Pc)
-                continue;
-
-            var character = (Character*)obj;
-            var known = mutedCharacters.TryGetValue((nint)obj, out var muted) && muted.EntityId == obj->EntityId;
-
-            if (!ShouldMute(character))
-            {
-                if (known)
-                    Unmute(character, muted!);
-
-                continue;
-            }
-
-            if (!known)
-            {
-                mutedCharacters[(nint)obj] = muted = new MutedCharacter
-                {
-                    EntityId = obj->EntityId,
-                    Category = character->SoundVolumeCategory,
-                    CategoryOverride = character->SoundVolumeCategoryOverride,
-                };
-            }
-            else
-            {
-                if (character->SoundVolumeCategory != NoPlayCategory)
-                    muted!.Category = character->SoundVolumeCategory;
-
-                if (character->SoundVolumeCategoryOverride != NoPlayCategory)
-                    muted!.CategoryOverride = character->SoundVolumeCategoryOverride;
-            }
-
-            muted!.Seen = true;
-            character->SoundVolumeCategory = NoPlayCategory;
-            character->SoundVolumeCategoryOverride = NoPlayCategory;
+            if (obj != null && obj->ObjectKind == ObjectKind.Pc)
+                UpdateMute((Character*)obj);
         }
 
         foreach (var (address, entry) in mutedCharacters)
@@ -720,6 +837,163 @@ public sealed unsafe class VfxFilterModule : IDisposable
             mutedCharacters.Remove(address);
 
         unmutedScratch.Clear();
+    }
+
+    private void MuteEarly(VfxActorInfo source)
+    {
+        if (source.Kind != ObjectKind.Pc || source.EmoteId == 0 || source.ObjectIndex is < 0 or >= CharacterSlotEnd
+            || !Plugin.Framework.IsInFrameworkUpdateThread)
+            return;
+
+        var obj = GameObjectManager.Instance()->Objects.IndexSorted[source.ObjectIndex].Value;
+        if (obj != null && obj->ObjectKind == ObjectKind.Pc && obj->EntityId == source.EntityId)
+            UpdateMute((Character*)obj);
+    }
+
+    private nint PlaySoundDetour(nint manager, nint data, float volume, int a4, float x, float y, float z, float a8,
+        int a9, int a10, byte a11, int category, byte a13, int a14, byte a15, byte a16, byte a17, byte a18)
+    {
+        var stopped = false;
+        try
+        {
+            if (category != NoPlayCategory && IsAtMutedPlayer(x, y, z))
+            {
+                category = NoPlayCategory;
+                stopped = true;
+                SoundsStopped++;
+            }
+        }
+        catch (Exception ex)
+        {
+            errors.Error(ex, "VfxFilter: error while checking where a sound plays.");
+        }
+
+        if (RecordSounds)
+        {
+            try
+            {
+                RecordSound(data, category, x, y, z, stopped);
+            }
+            catch (Exception ex)
+            {
+                errors.Error(ex, "VfxFilter: error while recording a sound.");
+            }
+        }
+
+        return playSoundHook!.Original(manager, data, volume, a4, x, y, z, a8, a9, a10, a11, category, a13, a14, a15, a16, a17, a18);
+    }
+
+    private bool IsAtMutedPlayer(float x, float y, float z)
+    {
+        if (mutedCharacters.Count == 0 || !Plugin.Framework.IsInFrameworkUpdateThread)
+            return false;
+
+        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
+        for (var i = 0; i < CharacterSlotEnd; i += 2)
+        {
+            var obj = objects[i].Value;
+            if (obj == null || obj->ObjectKind != ObjectKind.Pc
+                || !mutedCharacters.TryGetValue((nint)obj, out var muted) || muted.EntityId != obj->EntityId)
+                continue;
+
+            var dx = obj->Position.X - x;
+            var dy = obj->Position.Y - y;
+            var dz = obj->Position.Z - z;
+            if (dx * dx + dy * dy + dz * dz <= MutedSoundRadius * MutedSoundRadius)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void RecordSound(nint data, int category, float x, float y, float z, bool stopped)
+    {
+        if (!Plugin.Framework.IsInFrameworkUpdateThread)
+        {
+            AddSoundRecord(new SoundRecord(DateTime.Now, category, stopped, "other thread", 0, data, x, y, z));
+            return;
+        }
+
+        var nearest = string.Empty;
+        var nearestDistance = float.MaxValue;
+        var objects = GameObjectManager.Instance()->Objects.IndexSorted;
+        for (var i = 0; i < CharacterSlotEnd; i += 2)
+        {
+            var obj = objects[i].Value;
+            if (obj == null || obj->ObjectKind != ObjectKind.Pc)
+                continue;
+
+            var dx = obj->Position.X - x;
+            var dy = obj->Position.Y - y;
+            var dz = obj->Position.Z - z;
+            var distance = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = DescribeObject(obj);
+            }
+        }
+
+        AddSoundRecord(new SoundRecord(DateTime.Now, category, stopped, nearest, nearestDistance, data, x, y, z));
+    }
+
+    private string DescribeObject(GameObject* obj)
+    {
+        var info = Resolve(obj);
+        var text = info.IsLocalPlayer ? $"{info.Name} [self]" : info.Name;
+        if (info.EmoteId != 0)
+            text += $" ({(EmoteNames.TryGetValue(info.EmoteId, out var emote) ? emote : $"#{info.EmoteId}")})";
+
+        if (mutedCharacters.ContainsKey((nint)obj))
+            text += " [muted]";
+
+        return text;
+    }
+
+    private void AddSoundRecord(SoundRecord record)
+    {
+        lock (soundRecords)
+        {
+            soundRecords.AddFirst(record);
+            while (soundRecords.Count > SoundRecordCapacity)
+                soundRecords.RemoveLast();
+        }
+    }
+
+    private void UpdateMute(Character* character)
+    {
+        var obj = (GameObject*)character;
+        var known = mutedCharacters.TryGetValue((nint)obj, out var muted) && muted.EntityId == obj->EntityId;
+
+        if (!ShouldMute(character))
+        {
+            if (known)
+                Unmute(character, muted!);
+
+            return;
+        }
+
+        if (!known)
+        {
+            mutedCharacters[(nint)obj] = muted = new MutedCharacter
+            {
+                EntityId = obj->EntityId,
+                Category = character->SoundVolumeCategory,
+                CategoryOverride = character->SoundVolumeCategoryOverride,
+            };
+        }
+        else
+        {
+            if (character->SoundVolumeCategory != NoPlayCategory)
+                muted!.Category = character->SoundVolumeCategory;
+
+            if (character->SoundVolumeCategoryOverride != NoPlayCategory)
+                muted!.CategoryOverride = character->SoundVolumeCategoryOverride;
+        }
+
+        muted!.Seen = true;
+        character->SoundVolumeCategory = NoPlayCategory;
+        character->SoundVolumeCategoryOverride = NoPlayCategory;
     }
 
     private bool ShouldMute(Character* character)
@@ -873,6 +1147,10 @@ public sealed unsafe class VfxFilterModule : IDisposable
                 return string.Empty;
         }
 
+        var blockedEmote = !viaMinion && source.Kind == ObjectKind.Pc && source.EmoteId != 0 && IsBlockedPresetEmote(source.EmoteId);
+        if (blockedEmote && record.ModState == VfxModState.Modded)
+            NoteModdedEmote(source);
+
         var blamed = source.Kind == ObjectKind.Pc ? source : record.Target;
         if (record.ModState == VfxModState.Modded && blamed.Kind == ObjectKind.Pc && !blamed.IsLocalPlayer
             && PlayerKey.IsListed(Blacklist, blamed.Name, blamed.World))
@@ -890,7 +1168,7 @@ public sealed unsafe class VfxFilterModule : IDisposable
         if (PlayerKey.IsListed(Whitelist, source.Name, source.World))
             return string.Empty;
 
-        if (!viaMinion && record.ModState == VfxModState.Modded && source.EmoteId != 0 && IsBlockedPresetEmote(source.EmoteId))
+        if (blockedEmote && (record.ModState == VfxModState.Modded || (IsEmotePath(record.Path) && HasModdedEmote(source))))
             return "emote";
 
         if (!config.HideEffects)
@@ -910,6 +1188,26 @@ public sealed unsafe class VfxFilterModule : IDisposable
             return "rate limit";
 
         return string.Empty;
+    }
+
+    private static bool IsEmotePath(string path) => path.StartsWith("vfx/emote", StringComparison.OrdinalIgnoreCase);
+
+    private void NoteModdedEmote(VfxActorInfo source)
+    {
+        lock (moddedEmotes)
+        {
+            if (moddedEmotes.Count >= ModdedEmoteLimit)
+                moddedEmotes.Clear();
+
+            if (moddedEmotes.Add((source.EntityId, source.EmoteId)))
+                filterDirty = true;
+        }
+    }
+
+    private bool HasModdedEmote(VfxActorInfo source)
+    {
+        lock (moddedEmotes)
+            return moddedEmotes.Contains((source.EntityId, source.EmoteId));
     }
 
     private static bool MatchesAny(List<string> patterns, string path)
@@ -1018,3 +1316,5 @@ public sealed unsafe class VfxFilterModule : IDisposable
         return obj != null ? Resolve(obj) : new VfxActorInfo(string.Empty, ObjectKind.None, (uint)id, false, false);
     }
 }
+
+public readonly record struct SoundRecord(DateTime Time, int Category, bool Stopped, string Nearest, float Distance, nint Data, float X, float Y, float Z);

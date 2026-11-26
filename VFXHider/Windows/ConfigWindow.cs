@@ -271,14 +271,52 @@ public class ConfigWindow : ThemedWindow, IDisposable
         var logToPluginLog = config.LogToPluginLog;
         if (ImGui.Checkbox("Also write spawns to /xllog", ref logToPluginLog))
             config.LogToPluginLog = logToPluginLog;
-        Hint("Writes a line to dalamud.log on disk for every effect spawned. Turn it off when you are done debugging.");
+        Hint("Writes a line to dalamud.log on disk for every effect spawned, plus hook status lines. Nothing but errors is written while this is off. Turn it off when you are done debugging.");
 
         ImGui.Spacing();
         ImGui.TextDisabled($"Game version: {(module.GameVersion.Length > 0 ? module.GameVersion : "unknown")} (verified on {VfxFilterModule.VerifiedGameVersion})");
-        ImGui.TextDisabled($"Hooks: {(module.IsHooked ? "active" : "off")} | signatures trusted: {(module.SignaturesTrusted ? "yes" : "no")}");
-        ImGui.TextDisabled($"Spawns seen: {module.SpawnsSeen} | modded: {module.ModdedSpawnsSeen} | hidden: {module.TotalHidden}");
+        ImGui.TextDisabled($"Hooks: {(module.IsHooked ? "active" : "off")} | run hook: {(module.IsRunHooked ? "active" : "off")} | sound hook: {(module.IsPlaySoundHooked ? "active" : "off")} | signatures trusted: {(module.SignaturesTrusted ? "yes" : "no")}");
+        ImGui.TextDisabled($"Spawns seen: {module.SpawnsSeen} | modded: {module.ModdedSpawnsSeen} | hidden: {module.TotalHidden} | stopped before playing: {module.RunsBlocked}");
+        ImGui.TextDisabled($"Sounds stopped at a muted player: {module.SoundsStopped}");
+        DrawSoundRecorder(module);
         ImGui.TextDisabled($"Penumbra file events: {module.PenumbraEvents} | vfx files: {module.PenumbraVfxFiles} | modded: {module.PenumbraModdedFiles} | matched to another player: {module.PenumbraFilesMatched}");
     }
+
+    private static void DrawSoundRecorder(VfxFilterModule module)
+    {
+        ImGui.Spacing();
+
+        using (ImRaii.Disabled(!module.IsPlaySoundHooked))
+        {
+            var record = module.RecordSounds;
+            if (ImGui.Checkbox("Record sounds", ref record))
+                module.RecordSounds = record;
+        }
+
+        Hint($"Keeps the last {VfxFilterModule.SoundRecordCapacity} sounds the game plays in memory only, nothing is written to disk or /xllog. Not saved, so it is off again after a reload.");
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy"))
+            ImGui.SetClipboardText(string.Join("\n", module.SoundRecords.Select(FormatSound)));
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear"))
+            module.ClearSoundRecords();
+
+        var records = module.SoundRecords;
+        using var child = ImRaii.Child("##SoundRecords", new Vector2(-1, 160 * ImGuiHelpers.GlobalScale), true);
+        if (!child.Success)
+            return;
+
+        if (records.Length == 0)
+            ImGui.TextDisabled(module.IsPlaySoundHooked ? "No sounds recorded." : "The sound play hook is not installed.");
+
+        foreach (var entry in records)
+            ImGui.TextUnformatted(FormatSound(entry));
+    }
+
+    private static string FormatSound(SoundRecord entry)
+        => $"{entry.Time:HH:mm:ss.fff}\tcat {entry.Category}{(entry.Stopped ? "\tstopped" : string.Empty)}\tnearest {entry.Nearest} at {entry.Distance:0.0}\tdata 0x{entry.Data:X}\tpos {entry.X:0.0},{entry.Y:0.0},{entry.Z:0.0}";
 
     private static void Hint(string text)
     {
